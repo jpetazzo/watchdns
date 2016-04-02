@@ -1,0 +1,98 @@
+#!/bin/sh
+LISTEN_PORT=$1
+RESOLVE_NAME=$2
+CONNECT_PORT=$3
+if [ -z "$CONNECT_PORT" ]; then
+    echo "Syntax: $0 <LISTEN_PORT> <RESOLVE_NAME> <CONNECT_PORT>"
+    exit 1
+fi
+
+# Following section taken from hamba directly.
+# Output a valid HAProxy configuration.
+config () {
+    # If the first parameter contains a semi-colon,
+    # assume that it's addr:port. Otherwise, assume
+    # that it's just a port number and put * in front.
+    case "$1" in
+        *:*) BIND="$1" ;;
+        *) BIND="*:$1" ;;
+    esac
+
+    # Generate the global section of the config file.
+    cat <<EOF
+global
+  daemon
+  maxconn 256
+
+defaults
+  mode tcp
+  timeout connect 5000ms
+  timeout client 50000ms
+  timeout server 50000ms
+
+frontend hamba-in
+  bind $BIND
+  default_backend hamba-out
+
+backend hamba-out
+EOF
+
+    # Now generate all the backend entries.
+    shift
+    while [ "$1" ]; do
+        # If the backend contains a semi-colon,
+        # assume that it's addr:port. Otherwise,
+        # assume that the backend address and port
+        # are given by two separate parameters.
+        case "$1" in
+        *:*)
+            echo "  server $(echo $1 | tr : -) $1 maxconn 32 check"
+            shift
+            ;;
+        *)
+            echo "  server $1-$2 $1:$2 maxconn 32 check"
+            shift
+            shift
+            ;;
+        esac
+    done
+
+    # If ADMIN is set, enable admin.
+    if [ "$ADMIN" ]; then cat <<EOF
+listen admin
+  mode http
+  bind $ADMIN
+  stats enable
+EOF
+    fi
+}
+
+# Hook to deal with signals correctly.
+stop () {
+    echo "Stopping main loop."
+    # TODO nicely terminate HAProxy
+    exit
+}
+trap stop TERM
+
+RECORDS=""
+
+while true; do
+    NEW_RECORDS=$(
+        drill $RESOLVE_NAME |
+        awk '{ if (($1=="'$RESOLVE_NAME'.") && ($4=="A")) {print $5} }' |
+        sort -n |
+        tr "\n" " "
+        )
+    if [ "$RECORDS" = "$NEW_RECORDS" ]; then
+        sleep 1
+        continue
+    fi
+    echo "$RESOLVE_NAME changed from [ $RECORDS] to [ $NEW_RECORDS]"
+    RECORDS="$NEW_RECORDS"
+    config $LISTEN_PORT $(for RECORD in $RECORDS; do 
+                            echo $RECORD $CONNECT_PORT
+                          done) >~/haproxy.tmp
+    mv ~/haproxy.tmp ~/haproxy.new
+done
+
